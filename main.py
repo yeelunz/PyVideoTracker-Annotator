@@ -27,8 +27,8 @@ class AnnotationProject:
         self.video_path = video_path
         self.video_name = os.path.basename(video_path)
         self.categories = categories
-        self.category_to_id = {n:i+1 for i,n in enumerate(categories)}
-        self.id_to_category = {i+1:n for i,n in enumerate(categories)}
+        self.category_to_id = {n: i + 1 for i, n in enumerate(categories)}
+        self.id_to_category = {i + 1: n for i, n in enumerate(categories)}
         self.cap = cv2.VideoCapture(video_path)
         if not self.cap.isOpened():
             raise RuntimeError('無法開啟影片')
@@ -36,33 +36,57 @@ class AnnotationProject:
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 25
-        self.annotations_by_frame: Dict[int,List[Box]] = {}
+        self.annotations_by_frame = {}
         self.next_track_id = 1
         self.tmp_path = os.path.splitext(video_path)[0] + '.json.tmp'
-        self.undo_stack: List[Dict] = []
+        self.undo_stack = []
         self._load_tmp()
 
     def _load_tmp(self):
-        if not os.path.exists(self.tmp_path):
-            return
-        try:
-            with open(self.tmp_path,'r',encoding='utf-8') as f:
-                data = json.load(f)
-            self.next_track_id = data.get('next_track_id',1)
-            for k, arr in data.get('frames',{}).items():
-                fi = int(k)
-                self.annotations_by_frame[fi] = [Box(track_id=b['track_id'], category_id=b['category_id'], bbox=b['bbox']) for b in arr]
-        except Exception as e:
-            print('載入暫存檔失敗:', e)
+        # 優先從最終輸出的 COCO JSON 載入進度
+        coco_path = os.path.splitext(self.video_path)[0] + '.json'
+        if os.path.exists(coco_path):
+            try:
+                with open(coco_path,'r',encoding='utf-8') as f:
+                    data = json.load(f)
+                # 建立 image_id -> frame_index 對照
+                img_map = {}
+                for img in data.get('images', []):
+                    img_map[img['id']] = img.get('frame_index', 0)
+                frames: Dict[int, List[Box]] = {}
+                max_tid = 0
+                for ann in data.get('annotations', []):
+                    image_id = ann.get('image_id')
+                    frame_index = img_map.get(image_id, 0)
+                    track_id = ann.get('track_id', 0)
+                    category_id = ann.get('category_id', 1)
+                    bbox = ann.get('bbox', [0,0,0,0])
+                    frames.setdefault(frame_index, []).append(Box(track_id=track_id, category_id=category_id, bbox=bbox))
+                    if track_id > max_tid:
+                        max_tid = track_id
+                self.annotations_by_frame = frames
+                self.next_track_id = max(1, max_tid + 1)
+                return
+            except Exception as e:
+                print('載入 COCO JSON 失敗，嘗試載入暫存檔:', e)
+        # 回退：嘗試載入舊版暫存檔（相容舊專案）
+        if os.path.exists(self.tmp_path):
+            try:
+                with open(self.tmp_path,'r',encoding='utf-8') as f:
+                    data = json.load(f)
+                self.next_track_id = data.get('next_track_id',1)
+                for k, arr in data.get('frames',{}).items():
+                    fi = int(k)
+                    self.annotations_by_frame[fi] = [Box(track_id=b['track_id'], category_id=b['category_id'], bbox=b['bbox']) for b in arr]
+            except Exception as e:
+                print('載入暫存檔失敗:', e)
 
     def save_tmp(self):
-        data = { 'next_track_id': self.next_track_id,
-                 'frames': {str(fi): [ {'track_id':b.track_id,'category_id':b.category_id,'bbox':b.bbox} for b in boxes ] for fi, boxes in self.annotations_by_frame.items()}}
+        # 立即寫入 COCO-VID JSON（取代暫存）
         try:
-            with open(self.tmp_path,'w',encoding='utf-8') as f:
-                json.dump(data,f,ensure_ascii=False)
+            self.export_coco_vid()
         except Exception as e:
-            print('寫入暫存檔失敗:', e)
+            print('寫入 JSON 失敗:', e)
 
     def get_frame(self, index: int) -> Optional[np.ndarray]:
         if index < 0 or index >= self.total_frames:
@@ -372,44 +396,72 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle('PyVideoTracker-Annotator')
         self.resize(1200,800)
-        self.project: Optional[AnnotationProject] = None
-        self.timer = QTimer(self); self.timer.timeout.connect(self.next_frame)
+        # state
+        self.project = None
+        self.root_dir = None
+        self.categories = []
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.next_frame)
         self.is_playing = False
-        central = QWidget(); self.setCentralWidget(central)
+        # layout root
+        central = QWidget()
+        self.setCentralWidget(central)
         root = QHBoxLayout(central)
-        # left
+        # left area
         self.canvas_container = QVBoxLayout()
-        self.video_canvas_placeholder = QLabel('請開啟影片'); self.video_canvas_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.canvas_widget: Optional[VideoCanvas] = None
+        self.video_canvas_placeholder = QLabel('請開啟資料夾')
+        self.video_canvas_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.canvas_widget = None
         self.frame_info_label = QLabel('Frame: -/-')
-        self.canvas_container.addWidget(self.video_canvas_placeholder,1)
+        self.canvas_container.addWidget(self.video_canvas_placeholder, 1)
         self.canvas_container.addWidget(self.frame_info_label)
         controls = QHBoxLayout()
-        self.btn_prev = QPushButton('上一幀'); self.btn_prev.clicked.connect(self.prev_frame)
-        self.btn_play = QPushButton('播放'); self.btn_play.clicked.connect(self.toggle_play)
-        self.btn_next = QPushButton('下一幀'); self.btn_next.clicked.connect(self.next_frame)
-        self.slider = QSlider(Qt.Orientation.Horizontal); self.slider.valueChanged.connect(self.on_slider)
-        self.jump_edit = QLineEdit(); self.jump_edit.setPlaceholderText('跳轉幀 (Enter)'); self.jump_edit.returnPressed.connect(self.jump_to_frame)
-        controls.addWidget(self.btn_prev); controls.addWidget(self.btn_play); controls.addWidget(self.btn_next); controls.addWidget(self.slider,1); controls.addWidget(self.jump_edit)
+        self.btn_prev = QPushButton('上一幀')
+        self.btn_prev.clicked.connect(self.prev_frame)
+        self.btn_play = QPushButton('播放')
+        self.btn_play.clicked.connect(self.toggle_play)
+        self.btn_next = QPushButton('下一幀')
+        self.btn_next.clicked.connect(self.next_frame)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.valueChanged.connect(self.on_slider)
+        self.jump_edit = QLineEdit()
+        self.jump_edit.setPlaceholderText('跳轉幀 (Enter)')
+        self.jump_edit.returnPressed.connect(self.jump_to_frame)
+        controls.addWidget(self.btn_prev)
+        controls.addWidget(self.btn_play)
+        controls.addWidget(self.btn_next)
+        controls.addWidget(self.slider, 1)
+        controls.addWidget(self.jump_edit)
         self.canvas_container.addLayout(controls)
-        root.addLayout(self.canvas_container,3)
-        # right
-        side = QVBoxLayout(); side.addWidget(QLabel('類別'))
-        self.list_categories = QListWidget(); self.list_categories.itemClicked.connect(self.on_select_category)
-        side.addWidget(self.list_categories,1); side.addWidget(QLabel('本幀標註'))
-        self.list_boxes = QListWidget(); self.list_boxes.itemClicked.connect(self.on_select_box)
-        side.addWidget(self.list_boxes,2)
-        root.addLayout(side,1)
-        self._build_menu(); self._bind_shortcuts()
+        root.addLayout(self.canvas_container, 3)
+        # right area
+        side = QVBoxLayout()
+        side.addWidget(QLabel('影片'))
+        self.list_videos = QListWidget()
+        self.list_videos.itemClicked.connect(self.on_select_video)
+        side.addWidget(self.list_videos, 2)
+        side.addWidget(QLabel('類別'))
+        self.list_categories = QListWidget()
+        self.list_categories.itemClicked.connect(self.on_select_category)
+        side.addWidget(self.list_categories, 1)
+        side.addWidget(QLabel('本幀標註'))
+        self.list_boxes = QListWidget()
+        self.list_boxes.itemClicked.connect(self.on_select_box)
+        side.addWidget(self.list_boxes, 2)
+        root.addLayout(side, 1)
+        self._build_menu()
+        self._bind_shortcuts()
 
     # menu / shortcuts
     def _build_menu(self):
         m = self.menuBar().addMenu('檔案')
-        act_open = QAction('開啟影片', self); act_open.triggered.connect(self.open_video)
-        act_save = QAction('儲存進度', self); act_save.triggered.connect(self.save_tmp)
-        act_export = QAction('導出 COCO-VID', self); act_export.triggered.connect(self.export_json)
-        act_undo = QAction('復原', self); act_undo.setShortcut(QKeySequence('Ctrl+Z')); act_undo.triggered.connect(self.undo)
-        m.addAction(act_open); m.addAction(act_save); m.addAction(act_export); m.addAction(act_undo)
+        act_open = QAction('開啟資料夾', self)
+        act_open.triggered.connect(self.open_folder)
+        act_undo = QAction('復原', self)
+        act_undo.setShortcut(QKeySequence('Ctrl+Z'))
+        act_undo.triggered.connect(self.undo)
+        m.addAction(act_open)
+        m.addAction(act_undo)
 
     def _mk_action(self, text, slot, keys):
         if not isinstance(keys,list): keys=[keys]
@@ -424,37 +476,109 @@ class MainWindow(QMainWindow):
         self.addAction(self._mk_action('上一幀', self.prev_frame, Qt.Key.Key_Left))
         self.addAction(self._mk_action('上一幀2', self.prev_frame, Qt.Key.Key_A))
         self.addAction(self._mk_action('播放暫停', self.toggle_play, Qt.Key.Key_Space))
-        self.addAction(self._mk_action('儲存', self.save_tmp, QKeySequence('Ctrl+S')))
         self.addAction(self._mk_action('上一類別', self.prev_category, Qt.Key.Key_W))
         self.addAction(self._mk_action('下一類別', self.next_category, Qt.Key.Key_S))
         # Undo 已於功能表設定，不再重複
 
-    # project actions
-    def open_video(self):
-        path, _ = QFileDialog.getOpenFileName(self,'選擇影片','.', 'Video Files (*.mp4 *.avi *.mov)')
-        if not path: return
-        labels_path = os.path.join(os.path.dirname(path),'labels.txt')
+    # project actions (folder-first workflow)
+    def open_folder(self):
+        dir_path = QFileDialog.getExistingDirectory(self, '選擇資料夾', '.')
+        if not dir_path:
+            return
+        self.root_dir = dir_path
+        labels_path = os.path.join(self.root_dir, 'labels.txt')
         if not os.path.exists(labels_path):
             QMessageBox.information(self,'類別定義','未找到 labels.txt，建立預設 median_nerve')
-            with open(labels_path,'w',encoding='utf-8') as f: f.write('median_nerve\n')
-        with open(labels_path,'r',encoding='utf-8') as f:
-            categories = [l.strip() for l in f if l.strip()]
-        if not categories:
-            categories = ['median_nerve']
-        # 若多於一個也允許? 需求為預設只有一個, 這裡只保證無時給預設
-        self.project = AnnotationProject(path, categories)
-        self.slider.setMaximum(self.project.total_frames - 1)
-        if self.canvas_widget is not None: self.canvas_widget.setParent(None)
+            try:
+                with open(labels_path,'w',encoding='utf-8') as f: f.write('median_nerve\n')
+            except Exception as e:
+                QMessageBox.warning(self,'錯誤', f'無法建立 labels.txt: {e}')
+        try:
+            with open(labels_path,'r',encoding='utf-8') as f:
+                self.categories = [l.strip() for l in f if l.strip()]
+        except Exception:
+            self.categories = []
+        if not self.categories:
+            self.categories = ['median_nerve']
+        self.populate_categories()
+        self.populate_video_list()
+        if self.list_videos.count() > 0:
+            self.list_videos.setCurrentRow(0)
+            self.on_select_video(self.list_videos.currentItem())
+
+    def populate_video_list(self):
+        self.list_videos.clear()
+        if not self.root_dir:
+            return
+        # 掃描資料夾下的影片檔（不遞迴）
+        exts = {'.mp4','.avi','.mov','.mkv'}
+        try:
+            names = sorted([n for n in os.listdir(self.root_dir) if os.path.splitext(n)[1].lower() in exts])
+        except Exception as e:
+            QMessageBox.warning(self,'錯誤', f'讀取資料夾失敗: {e}')
+            return
+        for n in names:
+            vp = os.path.join(self.root_dir, n)
+            count = self.get_annotation_count_for_video(vp)
+            item = QListWidgetItem(f'{n}  (標註: {count})')
+            item.setData(Qt.ItemDataRole.UserRole, vp)
+            self.list_videos.addItem(item)
+
+    def get_annotation_count_for_video(self, video_path: str) -> int:
+    # 讀取即時輸出的 COCO-VID JSON
+        out_path = os.path.splitext(video_path)[0] + '.json'
+        try:
+            if os.path.exists(out_path):
+                with open(out_path,'r',encoding='utf-8') as f:
+                    data = json.load(f)
+                anns = data.get('annotations', [])
+                return len(anns)
+        except Exception:
+            pass
+        return 0
+
+    def on_select_video(self, item: QListWidgetItem):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if not path:
+            return
+        self.load_video(path)
+
+    def load_video(self, path: str):
+        # 先保存當前進度
+        if self.project:
+            try:
+                self.project.save_tmp()
+            except Exception:
+                pass
+        # 初始化專案
+        self.project = AnnotationProject(path, self.categories)
+        self.slider.setMaximum(max(0, self.project.total_frames - 1))
+        if self.canvas_widget is not None:
+            self.canvas_widget.setParent(None)
         self.canvas_widget = VideoCanvas(self.project)
         self.canvas_container.insertWidget(0, self.canvas_widget, 1)
         self.video_canvas_placeholder.hide()
         self.load_frame(0)
-        self.populate_categories()
+
+    def update_current_video_item_count(self):
+        # 以記憶體中專案為準，彙總當前影片標註數
+        if not self.project or not self.root_dir:
+            return
+        total = 0
+        for arr in self.project.annotations_by_frame.values():
+            total += len(arr or [])
+        # 找到目前選取的 item 並改文字
+        cur_item = self.list_videos.currentItem()
+        if cur_item:
+            name = os.path.basename(self.project.video_path)
+            cur_item.setText(f'{name}  (標註: {total})')
 
     def populate_categories(self):
         self.list_categories.clear()
-        if not self.project: return
-        for name in self.project.categories:
+        # 類別來自資料夾層級
+        if not self.categories:
+            return
+        for name in self.categories:
             self.list_categories.addItem(QListWidgetItem(name))
         if self.list_categories.count()>0:
             self.list_categories.setCurrentRow(0)
@@ -462,7 +586,6 @@ class MainWindow(QMainWindow):
     def load_frame(self,index:int):
         if not self.project: return
         index = max(0,min(index,self.project.total_frames-1))
-        self.project.save_tmp()
         self.canvas_widget.load_frame(index)
         self.slider.blockSignals(True); self.slider.setValue(index); self.slider.blockSignals(False)
         self.frame_info_label.setText(f'Frame: {index+1} / {self.project.total_frames}')
@@ -478,6 +601,8 @@ class MainWindow(QMainWindow):
             self.list_boxes.addItem(item)
             if select_track is not None and b.track_id == select_track:
                 self.list_boxes.setCurrentItem(item)
+        # 更新影片清單的計數顯示
+        self.update_current_video_item_count()
 
     def on_select_category(self,item: QListWidgetItem):
         if not self.project or not self.canvas_widget: return
@@ -521,14 +646,17 @@ class MainWindow(QMainWindow):
 
     def save_tmp(self):
         if self.project:
-            self.project.save_tmp(); QMessageBox.information(self,'保存','暫存已保存')
+            self.project.save_tmp();
+            self.update_current_video_item_count()
+            QMessageBox.information(self,'保存','暫存已保存')
 
     def export_json(self):
         if not self.project: return
         out = self.project.export_coco_vid(); QMessageBox.information(self,'導出完成', f'已輸出: {out}')
 
     def undo(self):
-        if not self.project: return
+        if not self.project:
+            return
         self.project.undo()
         if self.canvas_widget:
             self.canvas_widget.boxes = self.project.annotations_by_frame.get(self.canvas_widget.frame_index, [])
