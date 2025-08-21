@@ -207,6 +207,8 @@ class VideoCanvas(QWidget):
         self.drag_offset = QPointF(0,0)
         self.original_bbox: Optional[List[float]] = None
         self.setMouseTracking(True)
+    # 關鍵：允許接收鍵盤事件（Delete）
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.ghost_boxes: List[Box] = []  # 新增：上一幀提示框 (僅顯示，不可互動)
 
     # transform helpers
@@ -318,14 +320,19 @@ class VideoCanvas(QWidget):
         return None
 
     def mousePressEvent(self,event):
-        if event.button()!=Qt.MouseButton.LeftButton or self.frame is None: return
+        if event.button() != Qt.MouseButton.LeftButton or self.frame is None:
+            return
+        # 確保畫布取得鍵盤焦點，讓 Delete 能作用
+        self.setFocus()
         pos = event.position()
         handle = self._hit_handle(pos)
         if handle:
-            self.resizing = True; self.resize_handle = handle
+            self.resizing = True
+            self.resize_handle = handle
             for b in self.boxes:
                 if b.track_id == self.selected_track_id:
-                    self.original_bbox = b.bbox.copy(); break
+                    self.original_bbox = b.bbox.copy()
+                    break
             return
         tid = self._hit_box(pos)
         if tid is not None:
@@ -338,10 +345,15 @@ class VideoCanvas(QWidget):
                     self.drag_offset = QPointF(pos.x() - rect.left(), pos.y() - rect.top())
                     break
             self.parent().parent().update_box_list(select_track=tid)
-            self.update(); return
+            self.update()
+            return
         # start drawing
-        self.is_drawing = True; self.start_point = pos; self.current_rect = QRectF(pos,pos)
-        self.selected_track_id = None; self.dragging = self.resizing = False
+        self.is_drawing = True
+        self.start_point = pos
+        self.current_rect = QRectF(pos, pos)
+        self.selected_track_id = None
+        self.dragging = False
+        self.resizing = False
         self.update()
 
     def mouseMoveEvent(self,event):
@@ -601,6 +613,8 @@ class MainWindow(QMainWindow):
         self.canvas_widget = VideoCanvas(self.project)
         self.canvas_container.insertWidget(0, self.canvas_widget, 1)
         self.video_canvas_placeholder.hide()
+    # 預設將焦點設置到畫布，以便接收鍵盤事件（Delete）
+        self.canvas_widget.setFocus()
         self.load_frame(0)
         self.update_annotated_frames()
 
