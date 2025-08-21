@@ -2,11 +2,11 @@ import sys, os, json
 from dataclasses import dataclass
 from typing import List, Dict, Optional
 import cv2, numpy as np
-from PySide6.QtCore import Qt, QTimer, QRectF, QPointF
+from PySide6.QtCore import Qt, QTimer, QRectF, QPointF, QEvent
 from PySide6.QtGui import QAction, QPainter, QPen, QBrush, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QListWidget, QListWidgetItem, QSlider, QLineEdit, QMessageBox
+    QLabel, QPushButton, QListWidget, QListWidgetItem, QSlider, QLineEdit, QMessageBox, QInputDialog, QProgressDialog, QAbstractItemView
 )
 
 # ===================== Data Structures =====================
@@ -109,6 +109,26 @@ class AnnotationProject:
         self.annotations_by_frame[frame_index].append(box)
         self.undo_stack.append({'type':'add','frame':frame_index,'track_id':tid})
         self.save_tmp(); return tid
+
+    def add_box_with_track_id(self, frame_index: int, track_id: int, category_id: int, bbox: List[float]):
+        """在指定幀加入指定 track_id 的框；若該幀已有同 track，則改為更新其 bbox。
+        用於插值/延伸保持同一追蹤 ID。
+        """
+        arr = self.annotations_by_frame.setdefault(frame_index, [])
+        # 若已存在同 track，改為更新
+        for b in arr:
+            if b.track_id == track_id:
+                old = b.bbox.copy()
+                if old != bbox:
+                    b.bbox = bbox
+                    self.undo_stack.append({'type':'modify','frame':frame_index,'track_id':track_id,'old_bbox':old,'new_bbox':bbox})
+                self.save_tmp(); return track_id
+        # 否則新增
+        arr.append(Box(track_id=track_id, category_id=category_id, bbox=bbox))
+        self.undo_stack.append({'type':'add','frame':frame_index,'track_id':track_id})
+        if track_id >= self.next_track_id:
+            self.next_track_id = track_id + 1
+        self.save_tmp(); return track_id
 
     def delete_box(self, frame_index: int, track_id: int, push_undo: bool=True):
         arr = self.annotations_by_frame.get(frame_index)
@@ -217,8 +237,8 @@ class VideoCanvas(QWidget):
         self.frame_index = index
         # 取消自動複製：不再呼叫 clone_prev_if_needed
         self.boxes = self.project.annotations_by_frame.get(index, [])
-        # 若本幀尚無標註且不是第一幀，建立幽靈框供參考
-        if not self.boxes and index > 0:
+        # 一律顯示前一幀為幽靈框（第一幀沒有）
+        if index > 0:
             prev = self.project.annotations_by_frame.get(index-1, [])
             self.ghost_boxes = [Box(track_id=b.track_id, category_id=b.category_id, bbox=b.bbox.copy()) for b in prev]
         else:
@@ -395,7 +415,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('PyVideoTracker-Annotator')
-        self.resize(1200,800)
+        self.resize(1200, 800)
         # state
         self.project = None
         self.root_dir = None
@@ -403,10 +423,12 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.next_frame)
         self.is_playing = False
+
         # layout root
         central = QWidget()
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
+
         # left area
         self.canvas_container = QVBoxLayout()
         self.video_canvas_placeholder = QLabel('請開啟資料夾')
@@ -415,6 +437,7 @@ class MainWindow(QMainWindow):
         self.frame_info_label = QLabel('Frame: -/-')
         self.canvas_container.addWidget(self.video_canvas_placeholder, 1)
         self.canvas_container.addWidget(self.frame_info_label)
+
         controls = QHBoxLayout()
         self.btn_prev = QPushButton('上一幀')
         self.btn_prev.clicked.connect(self.prev_frame)
@@ -434,21 +457,41 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.jump_edit)
         self.canvas_container.addLayout(controls)
         root.addLayout(self.canvas_container, 3)
+
         # right area
         side = QVBoxLayout()
         side.addWidget(QLabel('影片'))
         self.list_videos = QListWidget()
         self.list_videos.itemClicked.connect(self.on_select_video)
         side.addWidget(self.list_videos, 2)
+
         side.addWidget(QLabel('類別'))
         self.list_categories = QListWidget()
         self.list_categories.itemClicked.connect(self.on_select_category)
         side.addWidget(self.list_categories, 1)
+
         side.addWidget(QLabel('本幀標註'))
         self.list_boxes = QListWidget()
         self.list_boxes.itemClicked.connect(self.on_select_box)
         side.addWidget(self.list_boxes, 2)
+
+        # 插值按鈕
+        self.btn_interpolate = QPushButton('插值')
+        self.btn_interpolate.setToolTip('以本幀唯一標註使用光流往後插值/延伸 N 幀（保持同一 track_id）')
+        self.btn_interpolate.clicked.connect(self.do_interpolate)
+        side.addWidget(self.btn_interpolate)
+
+        # 已標註幀清單（支援多選）
+        side.addWidget(QLabel('已標註幀'))
+        self.list_annotated_frames = QListWidget()
+        self.list_annotated_frames.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list_annotated_frames.installEventFilter(self)
+        self.list_annotated_frames.itemClicked.connect(self.on_select_annotated_frame)
+        side.addWidget(self.list_annotated_frames, 2)
+
         root.addLayout(side, 1)
+
+        # 功能表與快捷鍵
         self._build_menu()
         self._bind_shortcuts()
 
@@ -559,6 +602,7 @@ class MainWindow(QMainWindow):
         self.canvas_container.insertWidget(0, self.canvas_widget, 1)
         self.video_canvas_placeholder.hide()
         self.load_frame(0)
+        self.update_annotated_frames()
 
     def update_current_video_item_count(self):
         # 以記憶體中專案為準，彙總當前影片標註數
@@ -603,6 +647,8 @@ class MainWindow(QMainWindow):
                 self.list_boxes.setCurrentItem(item)
         # 更新影片清單的計數顯示
         self.update_current_video_item_count()
+        # 同步更新已標註幀清單
+        self.update_annotated_frames()
 
     def on_select_category(self,item: QListWidgetItem):
         if not self.project or not self.canvas_widget: return
@@ -663,6 +709,236 @@ class MainWindow(QMainWindow):
             self.canvas_widget.update()
         self.update_box_list()
 
+    # ============== 新增：已標註幀清單 ==============
+    def update_annotated_frames(self):
+        if not self.project:
+            self.list_annotated_frames.clear(); return
+        # 目前所有有標註的幀（非空）
+        items_map = {}
+        self.list_annotated_frames.clear()
+        for fi in sorted(k for k,v in self.project.annotations_by_frame.items() if v):
+            count = len(self.project.annotations_by_frame.get(fi, []))
+            text = f'第 {fi+1} 幀（{count}）'
+            it = QListWidgetItem(text)
+            it.setData(Qt.ItemDataRole.UserRole, fi)
+            self.list_annotated_frames.addItem(it)
+            items_map[fi] = it
+        # 高亮目前幀（若有在清單中）
+        if self.canvas_widget:
+            cur = self.canvas_widget.frame_index
+            if cur in items_map:
+                self.list_annotated_frames.setCurrentItem(items_map[cur])
+
+    def on_select_annotated_frame(self, item: QListWidgetItem):
+        fi = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(fi, int):
+            self.load_frame(fi)
+
+    def eventFilter(self, watched, event):
+        # 在已標註幀清單上按 Delete 時觸發批量刪除
+        if watched is getattr(self, 'list_annotated_frames', None) and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Delete:
+                self._delete_selected_annotated_frames()
+                return True
+        return super().eventFilter(watched, event)
+
+    def _delete_selected_annotated_frames(self):
+        if not self.project:
+            return
+        items = self.list_annotated_frames.selectedItems()
+        if not items:
+            return
+        frame_indices = []
+        for it in items:
+            fi = it.data(Qt.ItemDataRole.UserRole)
+            if isinstance(fi, int):
+                frame_indices.append(fi)
+        if not frame_indices:
+            return
+        frame_indices = sorted(set(frame_indices))
+        resp = QMessageBox.question(self, '刪除標註', f'確定刪除 {len(frame_indices)} 個幀的全部標註？此操作可用復原(Ctrl+Z)。', QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        for fi in frame_indices:
+            arr = list(self.project.annotations_by_frame.get(fi, []))
+            for b in arr:
+                self.project.delete_box(fi, b.track_id)
+        if self.canvas_widget:
+            self.canvas_widget.boxes = self.project.annotations_by_frame.get(self.canvas_widget.frame_index, [])
+            self.canvas_widget.update()
+        self.update_box_list()
+
+    def keyPressEvent(self, event):
+        # Delete: 若焦點在「已標註幀」清單，刪除所選幀的所有標註
+        if event.key() == Qt.Key.Key_Delete and hasattr(self, 'list_annotated_frames') and self.list_annotated_frames.hasFocus():
+            if not self.project:
+                return
+            items = self.list_annotated_frames.selectedItems()
+            if not items:
+                return
+            # 取得幀索引
+            frame_indices = []
+            for it in items:
+                fi = it.data(Qt.ItemDataRole.UserRole)
+                if isinstance(fi, int):
+                    frame_indices.append(fi)
+            if not frame_indices:
+                return
+            frame_indices = sorted(set(frame_indices))
+            # 確認
+            resp = QMessageBox.question(self, '刪除標註', f'確定刪除 {len(frame_indices)} 個幀的全部標註？此操作可用復原(Ctrl+Z)。', QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if resp != QMessageBox.StandardButton.Yes:
+                return
+            # 執行刪除（逐幀推入 undo）
+            for fi in frame_indices:
+                arr = self.project.annotations_by_frame.get(fi, [])
+                # 將當幀所有框以 delete 操作放入 undo（便於還原）
+                for b in list(arr):
+                    self.project.delete_box(fi, b.track_id)
+            # 若當前幀被刪空，更新畫面
+            if self.canvas_widget:
+                self.canvas_widget.boxes = self.project.annotations_by_frame.get(self.canvas_widget.frame_index, [])
+                self.canvas_widget.update()
+            self.update_box_list()
+            return
+        # 交給原本邏輯處理（含刪除當前幀選取框）
+        return super().keyPressEvent(event)
+
+    # ============== 新增：插值功能 ==============
+    def do_interpolate(self):
+        """使用光流法 (LK) 以當前幀的唯一標註往後插值 N 幀，並顯示可取消的進度條。"""
+        if not self.project or not self.canvas_widget:
+            return
+        fi = self.canvas_widget.frame_index
+        boxes = self.project.annotations_by_frame.get(fi, [])
+        if len(boxes) != 1:
+            QMessageBox.warning(self, '插值', '當前幀必須有且只有一個標註才能插值。')
+            return
+        b = boxes[0]
+        max_forward = max(0, self.project.total_frames - fi - 1)
+        if max_forward <= 0:
+            QMessageBox.information(self, '插值', '已到影片尾端，無法往後插值。')
+            return
+        n, ok = QInputDialog.getInt(self, '插值', '往後插值幾幀？', 5, 1, max_forward)
+        if not ok or n <= 0:
+            return
+
+        # 讀取當前與之後影格並執行 LK 光流追蹤
+        frame0 = self.project.get_frame(fi)
+        if frame0 is None:
+            QMessageBox.warning(self, '插值', '無法讀取當前影格。')
+            return
+        gray0 = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
+        H, W = gray0.shape[:2]
+
+        x, y, w, h = [float(v) for v in b.bbox]
+        # 初始化特徵點（限制在 bbox 內）
+        x0, y0, w0, h0 = int(round(x)), int(round(y)), int(round(w)), int(round(h))
+        x0 = max(0, min(W-1, x0)); y0 = max(0, min(H-1, y0))
+        w0 = max(1, min(W - x0, w0)); h0 = max(1, min(H - y0, h0))
+        roi = gray0[y0:y0+h0, x0:x0+w0]
+        if roi.size == 0:
+            QMessageBox.warning(self, '插值', 'bbox 超出畫面，無法插值。')
+            return
+        pts = cv2.goodFeaturesToTrack(roi, maxCorners=60, qualityLevel=0.01, minDistance=5)
+        if pts is not None:
+            pts = pts.reshape(-1, 2)
+            pts[:, 0] += x0
+            pts[:, 1] += y0
+        else:
+            # 若抓不到特徵點，退而求其次只用中心點
+            pts = np.array([[x + w/2, y + h/2]], dtype=np.float32)
+        pts = pts.astype(np.float32)
+
+        # 進度條
+        prog = QProgressDialog('插值中，請稍候…', '取消', 0, n, self)
+        prog.setWindowTitle('插值')
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(200)
+        prev_gray = gray0
+        prev_pts = pts
+        # 使用 bbox 中心 + 尺寸追蹤（相似變換）
+        cx, cy = x + w/2.0, y + h/2.0
+        cur_w, cur_h = w, h
+        for step in range(1, n+1):
+            if prog.wasCanceled():
+                break
+            tfi = fi + step
+            frame1 = self.project.get_frame(tfi)
+            if frame1 is None:
+                break
+            gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+
+            # 以目前中心與尺寸計算左上角（供重新偵測特徵）
+            cur_x = cx - cur_w/2.0
+            cur_y = cy - cur_h/2.0
+
+            if prev_pts is None or len(prev_pts) == 0:
+                # 重新偵測 bbox 內特徵（在上一幀）
+                rx, ry = int(round(cur_x)), int(round(cur_y))
+                rw, rh = int(round(cur_w)), int(round(cur_h))
+                rx = max(0, min(W-1, rx)); ry = max(0, min(H-1, ry))
+                rw = max(1, min(W - rx, rw)); rh = max(1, min(H - ry, rh))
+                roi1 = prev_gray[ry:ry+rh, rx:rx+rw]
+                pts = cv2.goodFeaturesToTrack(roi1, maxCorners=60, qualityLevel=0.01, minDistance=5)
+                if pts is not None:
+                    pts = pts.reshape(-1, 2)
+                    pts[:, 0] += rx
+                    pts[:, 1] += ry
+                    prev_pts = pts.astype(np.float32)
+                else:
+                    prev_pts = np.array([[cur_x + cur_w/2, cur_y + cur_h/2]], dtype=np.float32)
+
+            next_pts, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray1, prev_pts, None, winSize=(21,21), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+
+            good_prev = prev_pts[st.reshape(-1) == 1] if st is not None else prev_pts
+            good_next = next_pts[st.reshape(-1) == 1] if (st is not None and next_pts is not None) else prev_pts
+            if len(good_prev) >= 2 and len(good_next) >= 2:
+                # 估計相似變換（尺度+旋轉+平移）
+                M, inliers = cv2.estimateAffinePartial2D(good_prev, good_next, method=cv2.LMEDS)
+                if M is not None:
+                    # 平移
+                    dx, dy = float(M[0,2]), float(M[1,2])
+                    # 尺度（從旋轉尺度矩陣提取）
+                    a, b_ = float(M[0,0]), float(M[0,1])
+                    scale = max(0.2, min(5.0, np.sqrt(a*a + b_*b_)))
+                else:
+                    dx = dy = 0.0; scale = 1.0
+            elif len(good_prev) >= 1 and len(good_next) >= 1:
+                delta = good_next - good_prev
+                dx = float(np.median(delta[:, 0]))
+                dy = float(np.median(delta[:, 1]))
+                scale = 1.0
+            else:
+                dx = dy = 0.0; scale = 1.0
+
+            # 更新中心與尺寸
+            cx += dx
+            cy += dy
+            cur_w *= scale
+            cur_h *= scale
+            # 邊界限制（把中心->左上）
+            cur_w = max(1.0, min(W - 1.0, cur_w))
+            cur_h = max(1.0, min(H - 1.0, cur_h))
+            cur_x = max(0.0, min(W - 1.0, cx - cur_w/2.0))
+            cur_y = max(0.0, min(H - 1.0, cy - cur_h/2.0))
+            # 防止超出邊界導致負尺寸
+            cur_w = max(1.0, min(W - cur_x, cur_w))
+            cur_h = max(1.0, min(H - cur_y, cur_h))
+
+            self.project.add_box_with_track_id(tfi, b.track_id, b.category_id, [cur_x, cur_y, cur_w, cur_h])
+
+            # 為下一輪準備
+            prev_gray = gray1
+            prev_pts = good_next.reshape(-1, 2).astype(np.float32) if good_next is not None else None
+
+            prog.setValue(step)
+            QApplication.processEvents()
+
+        prog.setValue(n)
+        # 保持在當前幀，更新右側清單
+        self.update_box_list()
+
     def prev_category(self):
         row = self.list_categories.currentRow()
         if row > 0:
@@ -674,11 +950,7 @@ class MainWindow(QMainWindow):
             self.list_categories.setCurrentRow(row+1)
             self.on_select_category(self.list_categories.currentItem())
 
-    def keyPressEvent(self,event):
-        if event.key()==Qt.Key.Key_Delete and self.canvas_widget and self.canvas_widget.selected_track_id is not None:
-            self.canvas_widget.keyPressEvent(event)
-        else:
-            super().keyPressEvent(event)
+    
 
 # ===================== Entry =====================
 def main():
