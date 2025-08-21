@@ -10,10 +10,10 @@ if errorlevel 1 (
     pip install pyinstaller
 )
 
-pip show opencv-python >nul 2>&1
+pip show opencv-contrib-python >nul 2>&1
 if errorlevel 1 (
-    echo 正在安裝 opencv-python...
-    pip install opencv-python
+    echo 正在安裝 opencv-contrib-python...
+    pip install opencv-contrib-python
 )
 
 pip show PySide6 >nul 2>&1
@@ -35,7 +35,7 @@ if exist "build" rmdir /s /q "build"
 
 :: 使用 spec 文件進行打包
 echo 開始打包...
-pyinstaller --clean main.spec
+pyinstaller --clean PyVideoTracker-Annotator.spec
 
 if exist "dist\PyVideoTracker-Annotator\PyVideoTracker-Annotator.exe" (
     echo.

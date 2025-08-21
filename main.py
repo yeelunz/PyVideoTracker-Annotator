@@ -489,7 +489,7 @@ class MainWindow(QMainWindow):
 
         # 插值按鈕
         self.btn_interpolate = QPushButton('插值')
-        self.btn_interpolate.setToolTip('以本幀唯一標註使用光流往後插值/延伸 N 幀（保持同一 track_id）')
+        self.btn_interpolate.setToolTip('以本幀唯一標註使用 CSRT 追蹤器往後插值/延伸 N 幀（保持同一 track_id）')
         self.btn_interpolate.clicked.connect(self.do_interpolate)
         side.addWidget(self.btn_interpolate)
 
@@ -820,7 +820,7 @@ class MainWindow(QMainWindow):
 
     # ============== 新增：插值功能 ==============
     def do_interpolate(self):
-        """使用光流法 (LK) 以當前幀的唯一標註往後插值 N 幀，並顯示可取消的進度條。"""
+        """使用 CSRT 追蹤器以當前幀的唯一標註往後插值 N 幀，並顯示可取消的進度條。"""
         if not self.project or not self.canvas_widget:
             return
         fi = self.canvas_widget.frame_index
@@ -837,114 +837,74 @@ class MainWindow(QMainWindow):
         if not ok or n <= 0:
             return
 
-        # 讀取當前與之後影格並執行 LK 光流追蹤
+        # 取得第一幀與初始化 CSRT 追蹤器
         frame0 = self.project.get_frame(fi)
         if frame0 is None:
             QMessageBox.warning(self, '插值', '無法讀取當前影格。')
             return
-        gray0 = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
-        H, W = gray0.shape[:2]
+        H, W = frame0.shape[:2]
 
         x, y, w, h = [float(v) for v in b.bbox]
-        # 初始化特徵點（限制在 bbox 內）
-        x0, y0, w0, h0 = int(round(x)), int(round(y)), int(round(w)), int(round(h))
-        x0 = max(0, min(W-1, x0)); y0 = max(0, min(H-1, y0))
-        w0 = max(1, min(W - x0, w0)); h0 = max(1, min(H - y0, h0))
-        roi = gray0[y0:y0+h0, x0:x0+w0]
-        if roi.size == 0:
-            QMessageBox.warning(self, '插值', 'bbox 超出畫面，無法插值。')
+        # 邊界與最小尺寸保護
+        x = max(0.0, min(W - 1.0, x))
+        y = max(0.0, min(H - 1.0, y))
+        w = max(1.0, min(W - x, w))
+        h = max(1.0, min(H - y, h))
+        init_rect = (x, y, w, h)
+
+        # 建立 CSRT（相容不同 OpenCV 版本/命名）
+        def _create_csrt():
+            tracker = None
+            # OpenCV-contrib 4.x 通常為 cv2.legacy.TrackerCSRT_create
+            if hasattr(cv2, 'legacy') and hasattr(cv2.legacy, 'TrackerCSRT_create'):
+                tracker = cv2.legacy.TrackerCSRT_create()
+            elif hasattr(cv2, 'TrackerCSRT_create'):
+                tracker = cv2.TrackerCSRT_create()
+            else:
+                # 部分新版使用 MultiTracker API 的新風格類別
+                try:
+                    tracker = cv2.legacy.TrackerCSRT.create()
+                except Exception:
+                    tracker = None
+            return tracker
+
+        tracker = _create_csrt()
+        if tracker is None:
+            QMessageBox.critical(self, '插值', '此環境的 OpenCV 未提供 CSRT 追蹤器。請確認已安裝 opencv-contrib-python。')
             return
-        pts = cv2.goodFeaturesToTrack(roi, maxCorners=60, qualityLevel=0.01, minDistance=5)
-        if pts is not None:
-            pts = pts.reshape(-1, 2)
-            pts[:, 0] += x0
-            pts[:, 1] += y0
-        else:
-            # 若抓不到特徵點，退而求其次只用中心點
-            pts = np.array([[x + w/2, y + h/2]], dtype=np.float32)
-        pts = pts.astype(np.float32)
+        ok = tracker.init(frame0, tuple(map(float, init_rect)))
+        if not ok:
+            QMessageBox.warning(self, '插值', 'CSRT 初始化失敗，請調整框位置或大小後重試。')
+            return
 
         # 進度條
         prog = QProgressDialog('插值中，請稍候…', '取消', 0, n, self)
         prog.setWindowTitle('插值')
         prog.setWindowModality(Qt.WindowModality.WindowModal)
         prog.setMinimumDuration(200)
-        prev_gray = gray0
-        prev_pts = pts
-        # 使用 bbox 中心 + 尺寸追蹤（相似變換）
-        cx, cy = x + w/2.0, y + h/2.0
-        cur_w, cur_h = w, h
-        for step in range(1, n+1):
+
+        last_bbox = [x, y, w, h]
+        for step in range(1, n + 1):
             if prog.wasCanceled():
                 break
             tfi = fi + step
-            frame1 = self.project.get_frame(tfi)
-            if frame1 is None:
+            frame = self.project.get_frame(tfi)
+            if frame is None:
                 break
-            gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
-
-            # 以目前中心與尺寸計算左上角（供重新偵測特徵）
-            cur_x = cx - cur_w/2.0
-            cur_y = cy - cur_h/2.0
-
-            if prev_pts is None or len(prev_pts) == 0:
-                # 重新偵測 bbox 內特徵（在上一幀）
-                rx, ry = int(round(cur_x)), int(round(cur_y))
-                rw, rh = int(round(cur_w)), int(round(cur_h))
-                rx = max(0, min(W-1, rx)); ry = max(0, min(H-1, ry))
-                rw = max(1, min(W - rx, rw)); rh = max(1, min(H - ry, rh))
-                roi1 = prev_gray[ry:ry+rh, rx:rx+rw]
-                pts = cv2.goodFeaturesToTrack(roi1, maxCorners=60, qualityLevel=0.01, minDistance=5)
-                if pts is not None:
-                    pts = pts.reshape(-1, 2)
-                    pts[:, 0] += rx
-                    pts[:, 1] += ry
-                    prev_pts = pts.astype(np.float32)
-                else:
-                    prev_pts = np.array([[cur_x + cur_w/2, cur_y + cur_h/2]], dtype=np.float32)
-
-            next_pts, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray1, prev_pts, None, winSize=(21,21), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
-
-            good_prev = prev_pts[st.reshape(-1) == 1] if st is not None else prev_pts
-            good_next = next_pts[st.reshape(-1) == 1] if (st is not None and next_pts is not None) else prev_pts
-            if len(good_prev) >= 2 and len(good_next) >= 2:
-                # 估計相似變換（尺度+旋轉+平移）
-                M, inliers = cv2.estimateAffinePartial2D(good_prev, good_next, method=cv2.LMEDS)
-                if M is not None:
-                    # 平移
-                    dx, dy = float(M[0,2]), float(M[1,2])
-                    # 尺度（從旋轉尺度矩陣提取）
-                    a, b_ = float(M[0,0]), float(M[0,1])
-                    scale = max(0.2, min(5.0, np.sqrt(a*a + b_*b_)))
-                else:
-                    dx = dy = 0.0; scale = 1.0
-            elif len(good_prev) >= 1 and len(good_next) >= 1:
-                delta = good_next - good_prev
-                dx = float(np.median(delta[:, 0]))
-                dy = float(np.median(delta[:, 1]))
-                scale = 1.0
-            else:
-                dx = dy = 0.0; scale = 1.0
-
-            # 更新中心與尺寸
-            cx += dx
-            cy += dy
-            cur_w *= scale
-            cur_h *= scale
-            # 邊界限制（把中心->左上）
-            cur_w = max(1.0, min(W - 1.0, cur_w))
-            cur_h = max(1.0, min(H - 1.0, cur_h))
-            cur_x = max(0.0, min(W - 1.0, cx - cur_w/2.0))
-            cur_y = max(0.0, min(H - 1.0, cy - cur_h/2.0))
-            # 防止超出邊界導致負尺寸
-            cur_w = max(1.0, min(W - cur_x, cur_w))
-            cur_h = max(1.0, min(H - cur_y, cur_h))
-
-            self.project.add_box_with_track_id(tfi, b.track_id, b.category_id, [cur_x, cur_y, cur_w, cur_h])
-
-            # 為下一輪準備
-            prev_gray = gray1
-            prev_pts = good_next.reshape(-1, 2).astype(np.float32) if good_next is not None else None
+            ok, rect = tracker.update(frame)
+            if not ok or rect is None:
+                # 追蹤失敗就中止插值
+                QMessageBox.information(self, '插值', f'追蹤在第 {tfi + 1} 幀失敗，已停止插值。')
+                break
+            rx, ry, rw, rh = [float(v) for v in rect]
+            # 邊界保護
+            rx = max(0.0, min(W - 1.0, rx))
+            ry = max(0.0, min(H - 1.0, ry))
+            rw = max(1.0, min(W - rx, rw))
+            rh = max(1.0, min(H - ry, rh))
+            cur_bbox = [rx, ry, rw, rh]
+            last_bbox = cur_bbox
+            self.project.add_box_with_track_id(tfi, b.track_id, b.category_id, cur_bbox)
 
             prog.setValue(step)
             QApplication.processEvents()
