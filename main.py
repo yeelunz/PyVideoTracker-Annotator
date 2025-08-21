@@ -42,6 +42,68 @@ class AnnotationProject:
         self.undo_stack = []
         self._load_tmp()
 
+    # --- 平滑工具：對一段連續幀上的同一 track 的 bbox 做移動平均 ---
+    def smooth_track_mavg(self, track_id: int, frame_indices: List[int], kernel_size: int = 5, anchor_first: bool = True, modify_first: bool = False):
+        """對指定 track 在給定幀序列上做移動平均平滑。
+        - track_id: 要平滑的追蹤 ID
+        - frame_indices: 順序化的幀索引列表（例如 [f0, f1, ..., fn]）
+        - kernel_size: 奇數，移動平均視窗大小
+        - anchor_first: 若為 True，第一個有效幀的 bbox 會作為錨點參與平滑計算，但可選擇是否回寫修改
+        - modify_first: 若為 False，第一個有效幀不會被實際修改（僅用於計算）
+        """
+        if not frame_indices:
+            return
+        try:
+            k = max(1, int(kernel_size))
+        except Exception:
+            k = 5
+        if k % 2 == 0:
+            k += 1
+        # 收集存在的框
+        seq = []  # (fi, Box)
+        for fi in frame_indices:
+            arr = self.annotations_by_frame.get(fi, [])
+            for b in arr:
+                if b.track_id == track_id:
+                    seq.append((fi, b))
+                    break
+        if len(seq) <= 1:
+            return
+        xs = [float(b.bbox[0]) for _, b in seq]
+        ys = [float(b.bbox[1]) for _, b in seq]
+        ws = [float(b.bbox[2]) for _, b in seq]
+        hs = [float(b.bbox[3]) for _, b in seq]
+
+        def _mavg(arr, kk):
+            if kk <= 1 or len(arr) <= 1:
+                return arr[:]
+            pad = kk // 2
+            arr_np = np.asarray(arr, dtype=float)
+            arr_pad = np.pad(arr_np, (pad, pad), mode='edge')
+            kernel = np.ones(kk, dtype=float) / float(kk)
+            out = np.convolve(arr_pad, kernel, mode='valid')
+            return out.tolist()
+
+        sx = _mavg(xs, k)
+        sy = _mavg(ys, k)
+        sw = _mavg(ws, k)
+        sh = _mavg(hs, k)
+
+        # 邊界保護並寫回
+        W, H = self.width, self.height
+        for i, (fi, b) in enumerate(seq):
+            if i == 0 and anchor_first and not modify_first:
+                continue  # 保留第一幀原樣
+            nx, ny, nw, nh = float(sx[i]), float(sy[i]), float(sw[i]), float(sh[i])
+            # clamp
+            nx = max(0.0, min(W - 1.0, nx))
+            ny = max(0.0, min(H - 1.0, ny))
+            nw = max(1.0, min(W - nx, nw))
+            nh = max(1.0, min(H - ny, nh))
+            new_bbox = [nx, ny, nw, nh]
+            # 使用 update_box 以保留 undo 歷史
+            self.update_box(fi, track_id, new_bbox)
+
     def _load_tmp(self):
         # 優先從最終輸出的 COCO JSON 載入進度
         coco_path = os.path.splitext(self.video_path)[0] + '.json'
@@ -489,7 +551,7 @@ class MainWindow(QMainWindow):
 
         # 插值按鈕
         self.btn_interpolate = QPushButton('插值')
-        self.btn_interpolate.setToolTip('以本幀唯一標註使用 CSRT 追蹤器往後插值/延伸 N 幀（保持同一 track_id）')
+        self.btn_interpolate.setToolTip('以本幀唯一標註使用 CSRT 追蹤器往後插值/延伸 N 幀（保持同一 track_id），並自動以視窗=5做平滑')
         self.btn_interpolate.clicked.connect(self.do_interpolate)
         side.addWidget(self.btn_interpolate)
 
@@ -884,6 +946,7 @@ class MainWindow(QMainWindow):
         prog.setMinimumDuration(200)
 
         last_bbox = [x, y, w, h]
+        produced_frames = []  # 紀錄實際插值成功的幀索引
         for step in range(1, n + 1):
             if prog.wasCanceled():
                 break
@@ -905,11 +968,21 @@ class MainWindow(QMainWindow):
             cur_bbox = [rx, ry, rw, rh]
             last_bbox = cur_bbox
             self.project.add_box_with_track_id(tfi, b.track_id, b.category_id, cur_bbox)
+            produced_frames.append(tfi)
 
             prog.setValue(step)
             QApplication.processEvents()
 
         prog.setValue(n)
+        # 平滑插值結果（預設啟用，視窗=5）
+        if produced_frames:
+            win = 5
+            if win % 2 == 0:
+                win += 1
+            # 使用第一幀作為錨點，不改動其 bbox，只平滑後續插值幀
+            seq_frames = [fi] + produced_frames
+            self.project.smooth_track_mavg(b.track_id, seq_frames, kernel_size=win, anchor_first=True, modify_first=False)
+
         # 保持在當前幀，更新右側清單
         self.update_box_list()
 
