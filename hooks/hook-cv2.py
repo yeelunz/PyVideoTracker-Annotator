@@ -41,7 +41,7 @@ try:
     # create during collection (which would make a directory creation fail).
     for root, dirs, files in os.walk(cv2_path):
         for file in files:
-            # only include non-.py config/resource files (xml/yml/json/etc.)
+            # include common non-.py config/resource files
             if file.endswith(('.xml', '.yml', '.yaml', '.json', '.cfg', '.config')):
                 full_path = os.path.join(root, file)
                 rel_path = os.path.relpath(full_path, cv2_path)
@@ -50,6 +50,23 @@ try:
                     rel_path = file
                 dest = os.path.join('cv2_data', rel_path.replace('\\', '/'))
                 config_files.append((full_path, dest))
+
+    # Additionally ensure Python configuration modules that OpenCV loader expects
+    # (notably `config.py` or files named like `config-*.py`) are bundled into
+    # the actual `cv2` package directory so importlib/resource loading works.
+    try:
+        conf_candidate = os.path.join(cv2_path, 'config.py')
+        if os.path.exists(conf_candidate):
+            # place directly into the 'cv2' package directory so importlib
+            # can find it as a normal module (datas dest must be a folder).
+            config_files.append((conf_candidate, 'cv2'))
+        # also include any config-*.py files (some builds may use variants)
+        import glob
+        for p in glob.glob(os.path.join(cv2_path, 'config-*.py')):
+            # place into cv2/ as well
+            config_files.append((p, 'cv2'))
+    except Exception:
+        pass
 
     datas.extend(config_files)
 except Exception:
